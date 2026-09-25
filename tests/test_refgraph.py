@@ -395,6 +395,108 @@ class TestUnreachableDefs:
         result = analyze_references(schema)
         assert result["unreachable_defs"] == []
 
+    def test_root_ref_into_def_inner_subschema_marks_owner(self):
+        # 根侧本地 $ref 指向定义内部的子 schema（#/$defs/User/properties/name）：
+        # 按已解析目标所属的最近定义节点传播，User 实际被使用 -> 可达；
+        # edges 中保留原始目标路径（不折叠到定义根）；未使用的 Orphan 仍不可达
+        schema = {
+            "type": "object",
+            "properties": {"name": {"$ref": "#/$defs/User/properties/name"}},
+            "$defs": {
+                "User": {"type": "object", "properties": {"name": {"type": "string"}}},
+                "Orphan": True,
+            },
+        }
+        result = analyze_references(schema)
+        assert result["edges"] == [
+            {
+                "source": "#/properties/name",
+                "ref": "#/$defs/User/properties/name",
+                "target": "#/$defs/User/properties/name",
+            }
+        ]
+        assert unreachable_names(result) == ["Orphan"]
+        assert result["counts"]["unreachable_defs"] == 1
+
+    def test_reachable_def_ref_into_other_inner_subschema_propagates(self):
+        # 已可达定义中的引用落入另一定义内部片段：沿最近定义节点传播到 B；
+        # B 内部嵌套 $defs 中无人使用的 Dead 仍是死定义
+        schema = {
+            "properties": {"a": {"$ref": "#/$defs/A"}},
+            "$defs": {
+                "A": {"properties": {"x": {"$ref": "#/$defs/B/properties/p"}}},
+                "B": {
+                    "properties": {"p": {"type": "string"}},
+                    "$defs": {"Dead": True},
+                },
+            },
+        }
+        result = analyze_references(schema)
+        assert unreachable_names(result) == ["Dead"]
+
+    def test_root_ref_into_nested_def_inner_subschema_skips_outer(self):
+        # 根侧引用落入嵌套内层定义的内部子 schema：只标记最近的内层定义，
+        # 不应顺带标记外层顶层定义；外层 nested 从未被使用仍不可达
+        schema = {
+            "properties": {
+                "a": {"$ref": "#/$defs/nested/$defs/Inner/properties/x"}
+            },
+            "$defs": {
+                "nested": {
+                    "$defs": {"Inner": {"properties": {"x": {"type": "string"}}}}
+                }
+            },
+        }
+        result = analyze_references(schema)
+        pointers = [item["pointer"] for item in result["unreachable_defs"]]
+        assert pointers == ["#/$defs/nested"]
+
+    def test_inner_subschema_ref_with_escaped_pointer(self):
+        # 键名含 / 的定义：~1 与 %2F 两种转义都归一解析，最近定义节点
+        # 归属在解码后的路径上判定，故两种写法都让 a/b 可达
+        schema = {
+            "properties": {
+                "t": {"$ref": "#/$defs/a~1b/properties/n"},
+                "p": {"$ref": "#/$defs/a%2Fb/properties/n"},
+            },
+            "$defs": {"a/b": {"properties": {"n": {"type": "string"}}}},
+        }
+        result = analyze_references(schema)
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+        assert {e["source"]: e["target"] for e in result["edges"]} == {
+            "#/properties/t": "#/$defs/a~1b/properties/n",
+            "#/properties/p": "#/$defs/a~1b/properties/n",
+        }
+
+    def test_inner_subschema_followed_by_ref_into_second_def(self):
+        # 根侧引用 A 的内部片段 -> A 可达；展开 A 子树时其内部引用到 B
+        # 定义根，B 同样可达（子 schema 片段目标与定义根目标混合传播）
+        schema = {
+            "properties": {"a": {"$ref": "#/$defs/A/anyOf/0"}},
+            "$defs": {
+                "A": {"anyOf": [{"properties": {"b": {"$ref": "#/$defs/B"}}}]},
+                "B": {"type": "string"},
+            },
+        }
+        result = analyze_references(schema)
+        assert result["invalid_refs"] == []
+        assert result["unreachable_defs"] == []
+
+    def test_missing_inner_subschema_ref_still_invalid(self):
+        # 指向不存在的内部路径仍是无效引用（不产生边、不影响可达性判定）
+        schema = {
+            "properties": {"a": {"$ref": "#/$defs/User/properties/missing"}},
+            "$defs": {"User": {"properties": {"name": {"type": "string"}}}},
+        }
+        result = analyze_references(schema)
+        assert invalid_map(result) == {
+            "#/properties/a": "target_not_found"
+        }
+        assert unreachable_names(result) == ["User"]
+        assert result["counts"]["edges"] == 0
+        assert result["counts"]["invalid_refs"] == 1
+
     def test_unreachable_sorted_by_pointer(self):
         schema = {
             "$defs": {"z": True, "a": True, "m": True},

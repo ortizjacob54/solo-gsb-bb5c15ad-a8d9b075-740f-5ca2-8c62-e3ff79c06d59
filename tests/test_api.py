@@ -1524,6 +1524,39 @@ def test_reference_diagnostics_ignores_extension_data(client):
     ]
 
 
+def test_reference_diagnostics_inner_subschema_target(client):
+    # 根侧 $ref 指向定义内部子 schema：edges 保留原始目标路径，
+    # 可达性按最近定义节点传播（User 不报为 unreachable，Ghost 才报）
+    resp = client.post("/api/reference-diagnostics", json={
+        "schema": {
+            "type": "object",
+            "properties": {
+                "name": {"$ref": "#/$defs/User/properties/name"},
+                "bad": {"$ref": "#/$defs/User/properties/missing"},
+            },
+            "$defs": {
+                "User": {"properties": {"name": {"type": "string"}}},
+                "Ghost": True,
+            },
+        }
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["edges"] == [
+        {
+            "source": "#/properties/name",
+            "ref": "#/$defs/User/properties/name",
+            "target": "#/$defs/User/properties/name",
+        }
+    ]
+    assert [d["name"] for d in data["unreachable_defs"]] == ["Ghost"]
+    assert data["counts"] == {
+        "refs": 2, "edges": 1, "invalid_refs": 1,
+        "unreachable_defs": 1, "cycles": 0,
+    }
+    assert data["invalid_refs"][0]["reason"] == "target_not_found"
+
+
 def test_reference_diagnostics_is_readonly(client):
     before = client.get("/api/analyses").json()["total"]
     resp = client.post("/api/reference-diagnostics", json={"schema": REF_DIAG_SCHEMA})

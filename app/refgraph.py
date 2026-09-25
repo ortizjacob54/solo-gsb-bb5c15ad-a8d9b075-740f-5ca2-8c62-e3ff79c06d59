@@ -17,10 +17,15 @@
 以及定义内部嵌套 ``$defs`` 的子节点，嵌套定义与包裹它的顶层定义是
 **不同节点**）。一条引用边按其源位置归属：源在某节点子树内（定义自身
 或其 properties / items / 组合分支等）即为该节点发出的边；源在所有
-$defs 节点之外（根侧结构）时，其精确指向的定义节点是可达性 BFS 的种子。
+$defs 节点之外（根侧结构）时，其目标所属的最近定义节点是可达性 BFS
+的种子（目标落在定义内部子 schema 也算使用该定义；精确命中嵌套内层
+定义时只播种内层）。
 
 * **可达性**：从种子出发沿已到达节点内部发出的**全部**引用边传播，
-  未被任何根侧引用链指向的 $defs 节点即"死定义"；
+  未被任何根侧引用链指向的 $defs 节点即"死定义"。种子与传播目标都按
+  **已解析目标所属的最近定义节点**归属——引用落入某定义内部的子 schema
+  （如 ``#/$defs/User/properties/name``）即视为使用了该定义；但精确命中
+  嵌套内层定义（``.../$defs/Inner``）只归属内层，不顺带标记外层定义；
 * **循环**：每个节点取源路径最浅的出边作为代表边（定义对象自身的
   ``$ref`` 优先于子树内引用），沿代表边追踪至多落入一个环，按
   "环上最小指针旋转到链首"规范化去重；根侧节点引用文档根（``#``）
@@ -403,8 +408,12 @@ def _def_graph(
     * 源在某 $defs 节点子树内的边 -> 该节点的出边；一个节点有多条出边
       时记录源路径最浅者（定义对象**自身**的 ``$ref``）为代表边，供
       循环检测使用（可达性在调用方使用全部出边 BFS）；
-    * 源在所有 $defs 节点之外（根侧）且目标**恰好**是某 $defs 节点
-      -> BFS 种子；
+    * 源在所有 $defs 节点之外（根侧）时，按**目标所属的最近定义节点**
+      播种：目标精确命中定义根，或落入定义内部的子 schema
+      （如 ``#/$defs/User/properties/name``）都算使用了该定义；精确
+      命中嵌套内层定义时最近节点就是内层本身，不会顺带标记外层定义；
+    * 定义节点之间的代表边仍要求目标精确命中定义根——指向定义内部
+      子 schema 的边不参与定义节点间的循环检测；
     * 顶层定义与其内嵌 ``$defs`` 子节点是不同的图节点。
 
     返回 ``(节点代表出边, 代表边的源相对深度, 根侧种子节点列表)``。
@@ -415,11 +424,16 @@ def _def_graph(
     for edge in edges:
         source_segments = _pointer_segments(edge["source"])
         source_def = _nearest_def(source_segments, def_pointers)
-        target_def = edge["target"] if edge["target"] in def_pointers else None
+        target_owner = _nearest_def(
+            _pointer_segments(edge["target"]), def_pointers
+        )
         if source_def is None:
-            if target_def is not None:
-                seeds.append(target_def)
+            # 根侧引用：按已解析目标所属的最近定义节点播种
+            if target_owner is not None:
+                seeds.append(target_owner)
             continue
+        # 代表出边（供循环检测）仅连接定义根节点
+        target_def = edge["target"] if edge["target"] in def_pointers else None
         if target_def is None:
             continue
         depth = len(source_segments) - len(_pointer_segments(source_def))
@@ -432,9 +446,12 @@ def _def_graph(
 def _reachable_defs(edges: list[dict], def_pointers: set[str]) -> set[str]:
     """在 $defs 节点粒度上做 BFS，返回从根侧可达的节点指针集合。
 
-    种子 = 根侧引用边精确指向的 $defs 节点；传播时沿**已到达节点内部
-    发出的全部引用边**展开——定义内部属性 / 分支引用到的其它定义
-    （包括嵌套 $defs 节点）同样可达。
+    种子 = 根侧引用边目标所属的最近 $defs 节点（精确命中层级定义根，
+    或落入定义内部子 schema，均按最近定义节点归属）；传播时沿**已到达
+    节点内部发出的全部引用边**展开——目标同样按其所属最近定义节点
+    归属，故定义内部属性 / 分支引用到的其它定义内部片段（包括嵌套
+    $defs 中的定义）同样能让对应定义节点可达。精确命中嵌套内层定义
+    时最近节点是内层本身，不会顺带标记其外层定义。
     """
     _, _, seeds = _def_graph(edges, def_pointers)
     reached: set[str] = set()
@@ -450,10 +467,12 @@ def _reachable_defs(edges: list[dict], def_pointers: set[str]) -> set[str]:
             source = edge["source"]
             if source != owner and not source.startswith(owner + "/"):
                 continue
-            target = edge["target"]
-            if target in def_pointers and target not in reached:
-                reached.add(target)
-                queue.append(target)
+            target_owner = _nearest_def(
+                _pointer_segments(edge["target"]), def_pointers
+            )
+            if target_owner is not None and target_owner not in reached:
+                reached.add(target_owner)
+                queue.append(target_owner)
     return reached
 
 
