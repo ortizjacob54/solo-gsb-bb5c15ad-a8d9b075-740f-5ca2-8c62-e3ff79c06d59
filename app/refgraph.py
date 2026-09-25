@@ -17,10 +17,15 @@
 以及定义内部嵌套 ``$defs`` 的子节点，嵌套定义与包裹它的顶层定义是
 **不同节点**）。一条引用边按其源位置归属：源在某节点子树内（定义自身
 或其 properties / items / 组合分支等）即为该节点发出的边；源在所有
-$defs 节点之外（根侧结构）时，其精确指向的定义节点是可达性 BFS 的种子。
+$defs 节点之外（根侧结构）时，其已解析目标（**含定义内部的子 schema**，
+如 ``#/$defs/User/properties/name``）所属的最近定义节点是可达性 BFS
+的种子。
 
-* **可达性**：从种子出发沿已到达节点内部发出的**全部**引用边传播，
-  未被任何根侧引用链指向的 $defs 节点即"死定义"；
+* **可达性**：每条边按**已解析目标所属的最近定义节点**折叠——根侧引用
+  或已到达节点的引用，只要目标落在某定义子树内（不必精确命中定义根），
+  该定义即被标记可达，再沿其内部发出的全部引用边继续传播；直接引用
+  嵌套内层定义只标记该内层节点，不顺带标记包裹它的外层定义。未被任何
+  根侧引用链指向的 $defs 节点即"死定义"；
 * **循环**：每个节点取源路径最浅的出边作为代表边（定义对象自身的
   ``$ref`` 优先于子树内引用），沿代表边追踪至多落入一个环，按
   "环上最小指针旋转到链首"规范化去重；根侧节点引用文档根（``#``）
@@ -397,63 +402,73 @@ def _nearest_def(segments: list[str], def_pointers: set[str]) -> str | None:
 
 def _def_graph(
     edges: list[dict], def_pointers: set[str]
-) -> tuple[dict[str, str], dict[str, int], list[str]]:
+) -> tuple[dict[str, str], dict[str, int]]:
     """把引用边折叠到 ``$defs`` 节点粒度（含顶层与嵌套定义）的有向图。
 
-    * 源在某 $defs 节点子树内的边 -> 该节点的出边；一个节点有多条出边
-      时记录源路径最浅者（定义对象**自身**的 ``$ref``）为代表边，供
-      循环检测使用（可达性在调用方使用全部出边 BFS）；
-    * 源在所有 $defs 节点之外（根侧）且目标**恰好**是某 $defs 节点
-      -> BFS 种子；
-    * 顶层定义与其内嵌 ``$defs`` 子节点是不同的图节点。
+    仅供循环检测使用：源在某 $defs 节点子树内、且目标**恰好**是某 $defs
+    节点根的边才构成图的出边（指向定义内部子 schema 的边不产生定义间的
+    环）；一个节点有多条出边时记录源路径最浅者（定义对象**自身**的
+    ``$ref``）为代表边。
 
-    返回 ``(节点代表出边, 代表边的源相对深度, 根侧种子节点列表)``。
+    可达性的种子与传播按"已解析目标所属的最近定义节点"处理，见
+    :func:`_reachable_defs`，不使用本函数。
+
+    返回 ``(节点代表出边, 代表边的源相对深度)``。
     """
     def_out: dict[str, str] = {}
     source_depth: dict[str, int] = {}
-    seeds: list[str] = []
     for edge in edges:
         source_segments = _pointer_segments(edge["source"])
         source_def = _nearest_def(source_segments, def_pointers)
         target_def = edge["target"] if edge["target"] in def_pointers else None
-        if source_def is None:
-            if target_def is not None:
-                seeds.append(target_def)
-            continue
-        if target_def is None:
+        if source_def is None or target_def is None:
             continue
         depth = len(source_segments) - len(_pointer_segments(source_def))
         if source_def not in source_depth or depth < source_depth[source_def]:
             source_depth[source_def] = depth
             def_out[source_def] = target_def
-    return def_out, source_depth, seeds
+    return def_out, source_depth
 
 
 def _reachable_defs(edges: list[dict], def_pointers: set[str]) -> set[str]:
     """在 $defs 节点粒度上做 BFS，返回从根侧可达的节点指针集合。
 
-    种子 = 根侧引用边精确指向的 $defs 节点；传播时沿**已到达节点内部
-    发出的全部引用边**展开——定义内部属性 / 分支引用到的其它定义
-    （包括嵌套 $defs 节点）同样可达。
+    每条引用边对可达性的贡献按**所属最近定义节点**折叠：
+
+    * **种子**：源在所有 $defs 节点之外（根侧结构）的边，其已解析目标
+      落在哪个定义子树内（目标本身是定义根，或定义内部的子 schema，如
+      ``#/$defs/User/properties/name``），该目标所属的最近定义即为种子；
+    * **传播**：从已到达的定义节点**自身子树内**（不含其嵌套 $defs 子
+      节点的子树）发出的边，把已解析目标所属的最近定义标记为可达；
+    * 直接引用嵌套定义内层节点（如
+      ``#/$defs/outer/$defs/Inner/properties/x``）只标记 Inner，**不顺带**
+      标记包裹它的外层定义。
     """
-    _, _, seeds = _def_graph(edges, def_pointers)
+    # 预折叠：(源所属定义 or None, 目标所属定义 or None)；None 源 = 根侧
+    folded: list[tuple[str | None, str | None]] = []
+    for edge in edges:
+        source_def = _nearest_def(_pointer_segments(edge["source"]), def_pointers)
+        target_def = _nearest_def(_pointer_segments(edge["target"]), def_pointers)
+        folded.append((source_def, target_def))
+
     reached: set[str] = set()
     queue: deque[str] = deque()
-    for seed in seeds:
-        if seed not in reached:
-            reached.add(seed)
-            queue.append(seed)
+
+    def mark(node: str | None) -> None:
+        if node is not None and node not in reached:
+            reached.add(node)
+            queue.append(node)
+
+    # 根侧边：目标落入任何定义子树即为可达种子
+    for source_def, target_def in folded:
+        if source_def is None:
+            mark(target_def)
 
     while queue:
         owner = queue.popleft()
-        for edge in edges:
-            source = edge["source"]
-            if source != owner and not source.startswith(owner + "/"):
-                continue
-            target = edge["target"]
-            if target in def_pointers and target not in reached:
-                reached.add(target)
-                queue.append(target)
+        for source_def, target_def in folded:
+            if source_def == owner:
+                mark(target_def)
     return reached
 
 
@@ -469,7 +484,7 @@ def _find_cycles(edges: list[dict], def_pointers: set[str]) -> list[dict]:
     每个节点至多一条代表出边，沿出边追踪至多落入一个环；以"环上最小
     指针旋转到链首"规范化，使同一环只报一次且与遍历起点无关。
     """
-    def_out, _, _ = _def_graph(edges, def_pointers)
+    def_out, _ = _def_graph(edges, def_pointers)
     root_self_sources = sorted(
         edge["source"]
         for edge in edges
